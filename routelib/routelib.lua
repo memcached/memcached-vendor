@@ -42,6 +42,21 @@ local function dump(o)
    end
 end
 
+local function dump_pretty(o, indent)
+    indent = indent or ""
+    if type(o) == 'table' then
+        local s = '{\n'
+        local next_indent = indent .. "    "
+        for k,v in pairs(o) do
+            if type(k) ~= 'number' then k = '"'..k..'"' end
+            s = s .. next_indent .. '['..k..'] = ' .. dump_pretty(v, next_indent) .. ',\n'
+        end
+        return s .. indent .. '}'
+    else
+        return tostring(o)
+    end
+end
+
 -- classes for typing.
 -- NOTE: metatable classes do not cross VM's, so they may only be used in the
 -- same VM they were assigned (pools or routes)
@@ -84,10 +99,6 @@ function settings(a)
 end
 
 function pools(a)
-    if M.is_debug then
-        print("pools config:")
-        print(dump(a))
-    end
     -- merge the list so pools{} can be called multiple times
     local p = M.c_in.pools
     for k, v in pairs(a) do
@@ -96,8 +107,6 @@ function pools(a)
 end
 
 function routes(a)
-    dsay("routes:")
-    dsay(dump(a))
     if a["conf"] == nil then
         a["conf"] = {}
     end
@@ -115,7 +124,34 @@ function find_pools(m)
 end
 
 function local_zone(zone)
-    dsay(zone)
+    if zone then
+        dsay("=== local zone: ", zone)
+        M.c_in.local_zone = zone
+    else
+        return M.c_in.local_zone
+    end
+end
+
+function local_zone_from_env(envname)
+    local zone = os.getenv(envname)
+    if zone == nil then
+        error("failed to get local zone from environment variable: " .. envname)
+    end
+    dsay("=== local zone: ", zone)
+    M.c_in.local_zone = zone
+end
+
+function local_zone_from_file(filename)
+    local f, err, errno = io.open(filename, "r")
+    if f == nil then
+        error("failure while opening local zone file: " .. filename .. " " .. err)
+    end
+    local zone = f:read("l")
+    f:close()
+    if zone == nil then
+        error("failed to read local zone from file: " .. filename)
+    end
+    dsay("=== local zone: ", zone)
     M.c_in.local_zone = zone
 end
 
@@ -224,6 +260,8 @@ local function settings_parse(a)
             func(value)
         elseif setting == "pool_options" then
             M.pool_options = value
+        elseif setting == "backend_options" then
+            M.backend_options = value
         end
     end
 end
@@ -301,7 +339,21 @@ local function pools_make(conf)
         end
     end
 
-    local bopts = conf.backend_options
+    local bopts = {}
+    -- seed global overrides
+    if M.backend_options then
+        for k, v in pairs(M.backend_options) do
+            dsay("backend option using global override:", k, v)
+            bopts[k] = v
+        end
+    end
+    if conf.backend_options then
+        for k, v in pairs(conf.backend_options) do
+            dsay("backend option using local override:", k, v)
+            bopts[k] = v
+        end
+    end
+
     local s = {}
     -- TODO: some convenience functions for asserting?
     -- die more gracefully if backend list missing
@@ -317,6 +369,9 @@ end
 local function pools_parse(a)
     local pools = {}
     for name, conf in pairs(a) do
+        if name == "internal" then
+            error("pool name 'internal' is reserved, please use another name")
+        end
         -- Check if conf is a pool set or single pool.
         -- Add result to top level pools[name] either way.
         if string.find(name, "^set_") ~= nil then
@@ -629,6 +684,11 @@ local function make_router(set, pools)
                 error("invalid child given to route handler: " .. type(child))
             end
 
+            -- shortcut for the process-internal cache.
+            if child == "internal" then
+                return mcp.internal_handler
+            end
+
             -- if "^set_words_etc" then special parse
             -- if "^set_" then special parse
             -- else match against pools directly
@@ -733,6 +793,19 @@ end
 -- mcp_config_pools executes from the configuration thread
 -- mcp_config_routes executes from each worker thread
 
+function mcp_config_dump_state(c)
+    if M.is_debug then
+        dsay("======== GLOBAL SETTINGS CONFIG ========")
+        dsay(dump_pretty(c.settings))
+
+        dsay("======== POOLS CONFIG ========")
+        dsay(dump_pretty(c.pools))
+
+        dsay("======== ROUTES CONFIG ========")
+        dsay(dump_pretty(c.routes))
+    end
+end
+
 function mcp_config_pools()
     load_userconfig(mcp.start_arg)
     dsay("=== mcp_config_pools: start ===")
@@ -742,6 +815,7 @@ function mcp_config_pools()
     if M.c_in.settings then
         settings_parse(M.c_in.settings)
     end
+    mcp_config_dump_state(M.c_in)
 
     -- Step 1) create pool objects
     local pools = pools_parse(M.c_in.pools)
@@ -845,20 +919,32 @@ function route_allfastest_conf(t)
     return t
 end
 
--- so many layers of generation :(
 local function route_allfastest_f(rctx, arg)
-    local mode = mcp.WAIT_OK
+    local mode = mcp.WAIT_OK -- wait until first non-error
+    if arg.miss then
+        mode = mcp.WAIT_GOOD -- wait until first good or until all children return
+    end
+    local wait = arg.wait
+
     dsay("generating an allfastest function")
     return function(r)
         rctx:enqueue(r, arg)
-        local done = rctx:wait_cond(1, mode)
+        if wait then
+            -- return best result received after 'wait' time elapsed.
+            local done = rctx:wait_cond(1, mode, wait)
+        else
+            local done = rctx:wait_cond(1, mode)
+        end
         local final = nil
-        -- return first non-error.
+        -- return first good result, or non-error (if nothing good returned), or last error
+        -- TODO: convert to rctx:best_result(arg)
         for x=1, #arg do
-            local res, mode = rctx:result(arg[x])
-            if mode == mcp.RES_OK or mode == mcp.RES_GOOD then
+            local res, tag = rctx:result(arg[x])
+            if tag == mcp.RES_GOOD then
                 return res
-            else
+            elseif tag == mcp.RES_OK then
+                final = res
+            elseif final == nil or not final:ok() then
                 final = res
             end
         end
@@ -868,6 +954,10 @@ local function route_allfastest_f(rctx, arg)
 end
 
 -- copy request to all children, but return first response
+-- FIXME: fix the table in here:
+-- - using o as both an array and hash table and iterating over it in the main
+-- function, can be confusing for users and potentially harmful on editing
+-- later. Instead put the child handles into a sub-table.
 function route_allfastest_start(a, ctx, fgen)
     dsay("starting an allfastest handler")
     local o = {}
@@ -875,6 +965,8 @@ function route_allfastest_start(a, ctx, fgen)
         table.insert(o, fgen:new_handle(child))
     end
 
+    o.miss = a.miss
+    o.wait = a.wait
     fgen:ready({ a = o, n = ctx:label(), f = route_allfastest_f })
 end
 
@@ -894,13 +986,22 @@ function route_failover_conf(t, ctx)
         end
         t.stats_id = ctx:get_stats_id(name)
     end
+
+    if t.local_zone ~= nil then
+        zone = ctx:local_zone()
+    end
+
     return t
 end
 
+-- TODO: if final res is due to a timeout, we could return a more descriptive
+-- SERVER_ERROR
+-- .. also add another stats counter for timeout
 local function route_failover_f(rctx, arg)
     local limit = arg.limit
     local t = arg.t
     local miss = arg.miss
+    local wait = arg.wait
     local s = nil
     local s_id = 0
     if arg.stats_id then
@@ -910,34 +1011,69 @@ local function route_failover_f(rctx, arg)
 
     return function(r)
         local res = nil
+        local rmiss = nil -- flag if any children returned a miss
         for i=1, limit do
-            res = rctx:enqueue_and_wait(r, t[i])
+            if wait then
+                -- can return a nil res
+                -- lua has no 'continue'
+                res = rctx:enqueue_and_wait(r, t[i], wait)
+            else
+                res = rctx:enqueue_and_wait(r, t[i])
+            end
+
             if i > 1 and s then
                 -- increment the retries counter
                 s(s_id, 1)
             end
-            if (miss == true and res:hit()) or (miss == false and res:ok()) then
+
+            -- process result
+            if res == nil then
+                -- do nothing.
+            elseif res:hit() then
                 return res
+            elseif res:ok() then
+                if miss == true then
+                    -- save the ok/miss result and continue looping (treat miss as a failure)
+                    rmiss = res
+                else
+                    -- return ok/miss (treat miss as a good result)
+                    return res
+                end
             end
         end
 
-        -- didn't get what we want, return the final one.
+        -- didn't get what we want, return either miss (if any) or last error
+        if rmiss then
+            return rmiss
+        end
         return res
     end
 end
 
 function route_failover_start(a, ctx, fgen)
     local o = { t = {}, c = 0 }
-    -- NOTE: if given a limit, we don't actually need handles for every pool.
-    -- would be a nice small optimization to shuffle the list of children then
-    -- only grab N entries.
-    -- Not doing this _right now_ because I'm not confident children is an
-    -- array or not.
-    for _, child in pairs(a.children) do
-        table.insert(o.t, fgen:new_handle(child))
+
+    -- We have a local zone defined _and_ the children table seems to have
+    -- this zone defined. We must try this zone first.
+    local zone = a.local_zone
+    if zone ~= nil and a.children[zone] ~= nil then
+        table.insert(o.t, fgen:new_handle(a.children[zone]))
         o.c = o.c + 1
+        for name, child in pairs(a.children) do
+            if zone ~= name then
+                table.insert(o.t, fgen:new_handle(child))
+                o.c = o.c + 1
+            end
+        end
+        o.zone = zone
+    else
+        for _, child in pairs(a.children) do
+            table.insert(o.t, fgen:new_handle(child))
+            o.c = o.c + 1
+        end
     end
 
+    -- TODO: should zone cause shuffle to be ignored?
     if a.shuffle then
         -- shuffle the handle list
         for i=#o.t, 2, -1 do
@@ -958,6 +1094,7 @@ function route_failover_start(a, ctx, fgen)
         o.limit = hcount
     end
     o.stats_id = a.stats_id
+    o.wait = a.wait
 
     fgen:ready({ a = o, n = ctx:label(), f = route_failover_f })
 end
@@ -1070,6 +1207,49 @@ end
 
 --
 -- route_allsync end
+--
+
+--
+-- route_allasync start
+--
+
+function route_allasync_conf(t)
+    return t
+end
+
+local function route_allasync_f(rctx, arg)
+    local handles = arg.h
+    local mut = arg.m
+    local nres = rctx:response_new()
+
+    return function(r)
+        rctx:enqueue(r, handles)
+        rctx:wait_cond(0) -- do not wait
+        mut(nres, r) -- return a "NULL" response
+        return nres
+    end
+end
+
+function route_allasync_start(a, ctx, fgen)
+    dsay("starting an allasync route handler")
+    local o = {}
+    for _, v in pairs(a.children) do
+        table.insert(o, fgen:new_handle(v))
+    end
+    local mut = mcp.res_mutator_new(
+        { t = "resnull", idx = 1 }
+    )
+
+    fgen:ready({
+        a = { h = o, m = mut },
+        u = 1,
+        n = ctx:label(),
+        f = route_allasync_f,
+    })
+end
+
+--
+-- route_allasync end
 --
 
 --
@@ -1257,6 +1437,163 @@ end
 -- route_ttl end
 --
 
+--
+-- route_null start
+--
+
+function route_null_conf(t)
+    return t
+end
+
+function route_null_start(a, ctx, fgen)
+    local mut = mcp.res_mutator_new(
+        { t = "resnull", idx = 1 }
+    )
+
+    fgen:ready({
+        n = ctx:label(),
+        u = 1,
+        f = function(rctx)
+            local nres = rctx:response_new()
+            return function(r)
+                mut(nres, r)
+                return nres
+            end
+        end
+    })
+end
+
+--
+-- route_null end
+--
+
+--
+-- route_ratelim start
+-- NOTE: EXPERIMENTAL API. MAY CHANGE.
+--
+
+-- TODO:
+-- arg to use bytes of req/res instead of request rate.
+function route_ratelim_conf(t, arg)
+    if t.stats then
+        local name = ctx:label() .. "_limits"
+        if t.stats_name then
+            name = t.stats_name .. "_limits"
+        end
+        t.stats_id = ctx:get_stats_id(name)
+    end
+
+    if t.tickrate == nil then
+        t.tickrate = 1000
+    end
+
+    if t.limit == nil then
+        error("must specify limit to route_ratelim")
+    end
+    if t.fillrate == nil then
+        error("must specify fillrate to route_ratelim")
+    end
+
+    if t.global then
+        local tbf_global = mcp.ratelim_global_tbf({
+            limit = t.limit,
+            fillrate = t.fillrate,
+            tickrate = t.tickrate,
+        })
+        t.tbf_global = tbf_global
+    end
+    return t
+end
+
+local function route_ratelim_f(rctx, o)
+    local rlim = o.rlim
+    local h = o.handle
+    local null = o.null
+    local nres = rctx:response_new()
+
+    if o.fail_until_limit then
+        -- invert the rate limiter: disallow requests up until this rate.
+        return function(r)
+            if rlim(1) then
+                null(nres, r)
+                return nres
+            else
+                return rctx:enqueue_and_wait(r, h)
+            end
+        end
+    else
+        return function(r)
+            if rlim(1) then
+                return rctx:enqueue_and_wait(r, h)
+            else
+                -- TODO: allow specifying a "SERVER_ERROR" instead?
+                return null(r)
+            end
+        end
+    end
+end
+
+function route_ratelim_start(a, ctx, fgen)
+    local o = {}
+
+    o.handle = fgen:new_handle(a.child)
+    if a.global then
+        o.rlim = a.tbf_global
+    else
+        o.rlim = mcp.ratelim_tbf({
+            limit = a.limit,
+            fillrate = a.fillrate,
+            tickrate = a.tickrate,
+        })
+    end
+    o.null = mcp.res_mutator_new(
+        { t = "resnull", idx = 1 }
+    )
+    o.fail_until_limit = a.fail_until_limit
+
+    fgen:ready({
+        a = o,
+        u = 1,
+        n = ctx:label(),
+        f = route_ratelim_f
+    })
+end
+
+--
+-- route_ratelim end
+--
+
+--
+-- route_random start
+--
+
+function route_random_conf(t)
+    return t
+end
+
+function route_random_start(a, ctx, fgen)
+    local handles = {}
+    local count = 0
+
+    for k, child in pairs(a.children) do
+        table.insert(handles, fgen:new_handle(child))
+        count = count + 1
+    end
+
+    fgen:ready({
+        n = ctx:label(),
+        f = function(rctx)
+            return function(r)
+                local pool = handles[math.random(count)]
+                return rctx:enqueue_and_wait(r, pool)
+            end
+        end
+    })
+end
+
+--
+-- route_random end
+--
 
 register_route_handlers({
     "failover",
@@ -1266,4 +1603,7 @@ register_route_handlers({
     "direct",
     "zfailover",
     "ttl",
+    "null",
+    "ratelim",
+    "random"
 })
